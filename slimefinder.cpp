@@ -167,48 +167,119 @@ void runSearch(const SearchConfig& config) {
     // 因为对于相邻的匹配区块，检查周围 17x17 范围时会重复计算巨量次相同的 isSlimeChunk
     // 提前计算好我们能遇见的所有的可能的区块坐标！
     int searchRadius = config.maxWidth + R_CHUNK;
-    int gridWidth = 2 * searchRadius + 1;
-    vector<uint8_t> slimeChunkCache(gridWidth * gridWidth, 0);
+    long long gridWidth = 2LL * searchRadius + 1;
+    vector<uint8_t> slimeChunkCache((size_t)(gridWidth * gridWidth), 0);
 
     int baseSearchChunkX = centerChunkX - searchRadius;
     int baseSearchChunkZ = centerChunkZ - searchRadius;
 
-    for (int gx = 0; gx < gridWidth; ++gx) {
-        for (int gz = 0; gz < gridWidth; ++gz) {
-            slimeChunkCache[gx * gridWidth + gz] = isSlimeChunk(config.seed, baseSearchChunkX + gx, baseSearchChunkZ + gz) ? 1 : 0;
+    for (long long gx = 0; gx < gridWidth; ++gx) {
+        for (long long gz = 0; gz < gridWidth; ++gz) {
+            slimeChunkCache[(size_t)(gx * gridWidth + gz)] = isSlimeChunk(config.seed, baseSearchChunkX + (int)gx, baseSearchChunkZ + (int)gz) ? 1 : 0;
         }
     }
-
-    int x = 0, z = 0;
-    int dx = 0, dz = -1;
 
     auto startTime = chrono::steady_clock::now();
     auto lastReportTime = startTime;
     long long positionsChecked = 0;
+    
+    int x = 0, z = 0;
+    int dx = 0, dz = -1;
 
     for (long long i = 0; i < spiralLimit; ++i) {
-        // Fix spiral coordinate updates - should execute at end of block
-        int currentX = x;
-        int currentZ = z;
-        int cx = centerChunkX + currentX;
-        int cz = centerChunkZ + currentZ;
+        int cx = centerChunkX + x;
+        int cz = centerChunkZ + z;
         
-if (config.minWidth > 0 &&
+        bool skip = false;
+        if (config.minWidth > 0 &&
             cx >= centerChunkX - config.minWidth + 1 && cx <= centerChunkX + config.minWidth - 1 &&
             cz >= centerChunkZ - config.minWidth + 1 && cz <= centerChunkZ + config.minWidth - 1) {
-            
-            // Spiral path update logic for next iteration
-            if (x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z)) {
-                int temp = dx;
-                dx = -dz;
-                dz = temp;
-            }
-            x += dx;
-            z += dz;
-            continue;
+            skip = true;
         }
 
+        // Spiral path update logic for next iteration
+        if (x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z)) {
+            int temp = dx;
+            dx = -dz;
+            dz = temp;
+        }
+        x += dx;
+        z += dz;
+        
+        if (skip) continue;
+
+        int startInX = config.fineSearch ? 0 : 8; // 挂机点在区块中心 (偏移为 8)
+        int endInX = config.fineSearch ? 15 : 8;
+        int startInZ = config.fineSearch ? 0 : 8;
+        int endInZ = config.fineSearch ? 15 : 8;
+
+        for (int inX = startInX; inX <= endInX; ++inX) {
+            for (int inZ = startInZ; inZ <= endInZ; ++inZ) {
+                
+                positionsChecked++;
+
+                int blockX = cx * 16 + inX;
+                int blockZ = cz * 16 + inZ;
+
+                int blockSize = 0;
+                int chunkSize = 0;
+
+                long long startGx = (long long)cx - R_CHUNK - baseSearchChunkX;
+                long long startGz = (long long)cz - R_CHUNK - baseSearchChunkZ;
+                
+                const uint8_t* cacheBase = &slimeChunkCache[(size_t)(startGx * gridWidth + startGz)];
+                int weightOffset = (inX * 16 + inZ) * LIMIT * LIMIT;
+                const int* bWeightBase = &precomputedBlockWeights[weightOffset];
+                const int* cWeightBase = &precomputedChunkWeights[weightOffset];
+
+                for (int d_x = 0; d_x < LIMIT; ++d_x) {
+                    const uint8_t* cacheRow = cacheBase + d_x * gridWidth;
+                    const int* bWeightRow = bWeightBase + d_x * LIMIT;
+                    const int* cWeightRow = cWeightBase + d_x * LIMIT;
+                    
+                    int b_sum = 0;
+                    int c_sum = 0;
+
+                    // Fully unrollable branchless inner loop
+                    for (int d_z = 0; d_z < LIMIT; ++d_z) {
+                        uint8_t c = cacheRow[d_z]; // 1 or 0
+                        b_sum += bWeightRow[d_z] * c;
+                        c_sum += cWeightRow[d_z] * c;
+                    }
+                    
+                    blockSize += b_sum;
+                    chunkSize += c_sum;
+                }
+
+                if ((blockSize >= config.minBlockSize && blockSize <= config.maxBlockSize) || 
+                    (chunkSize >= config.minChunkSize && chunkSize <= config.maxChunkSize)) {
+                        
+                    // 只在大于当前找到的最大值时才记录并写入
+                    if (blockSize > currentMaxBlockSize || chunkSize > currentMaxChunkSize) {
+                        if (blockSize > currentMaxBlockSize) currentMaxBlockSize = blockSize;
+                        if (chunkSize > currentMaxChunkSize) currentMaxChunkSize = chunkSize;
+
+                        matches++;
+                        cout << "\r                                                                                                    \r";
+                        cout << "New Max found - Pos: " << blockX << "," << blockZ 
+                                << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
+                                << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
+                        
+                        lastReportTime = chrono::steady_clock::now(); 
+                        
+                        if (out.is_open()) {
+                            out << blockX << "," << blockZ << ";" 
+                                << cx << "c" << inX << "," << cz << "c" << inZ << ";" 
+                                << blockSize << ";" << chunkSize << "\n" << flush;
+                        }
+                    }
+                } 
+            } // end inZ
+        } // end inX
+        
         processedChunks++;
+
+        // Progress bar rendering
         auto now = chrono::steady_clock::now();
         if (chrono::duration_cast<chrono::milliseconds>(now - lastReportTime).count() > 100 || processedChunks == totalComputeChunks) {
             lastReportTime = now;
@@ -226,87 +297,11 @@ if (config.minWidth > 0 &&
                 else cout << " ";
             }
             cout << "] " << percent << "% (" << processedChunks << "/" << totalComputeChunks << ") "
-                 << "ETA: " << setfill('0') << setw(2) << (etaSeconds / 3600) << ":"
-                 << setw(2) << ((etaSeconds % 3600) / 60) << ":"
-                 << setw(2) << (etaSeconds % 60) << flush;
+                    << "ETA: " << setfill('0') << setw(2) << (etaSeconds / 3600) << ":"
+                    << setw(2) << ((etaSeconds % 3600) / 60) << ":"
+                    << setw(2) << (etaSeconds % 60) << flush;
         }
-
-        // Spiral path update logic for next iteration
-        if (x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z)) {
-            int temp = dx;
-            dx = -dz;
-            dz = temp;
-        }
-        x += dx;
-        z += dz;
-
-        int startInX = config.fineSearch ? 0 : (config.startX & 15);
-        int endInX = config.fineSearch ? 15 : (config.startX & 15);
-        int startInZ = config.fineSearch ? 0 : (config.startZ & 15);
-        int endInZ = config.fineSearch ? 15 : (config.startZ & 15);
-
-        for (int inX = startInX; inX <= endInX; ++inX) {
-            for (int inZ = startInZ; inZ <= endInZ; ++inZ) {
-                
-                positionsChecked++;
-
-                int blockX = cx * 16 + inX;
-                int blockZ = cz * 16 + inZ;
-
-                int blockSize = 0;
-                int chunkSize = 0;
-
-                int startGx = cx - R_CHUNK - baseSearchChunkX;
-                int startGz = cz - R_CHUNK - baseSearchChunkZ;
-                
-                const uint8_t* cacheBase = &slimeChunkCache[startGx * gridWidth + startGz];
-                int weightOffset = (inX * 16 + inZ) * LIMIT * LIMIT;
-                const int* bWeightBase = &precomputedBlockWeights[weightOffset];
-                const int* cWeightBase = &precomputedChunkWeights[weightOffset];
-
-                for (int dx = 0; dx < LIMIT; ++dx) {
-                    const uint8_t* cacheRow = cacheBase + dx * gridWidth;
-                    const int* bWeightRow = bWeightBase + dx * LIMIT;
-                    const int* cWeightRow = cWeightBase + dx * LIMIT;
-                    
-                    int b_sum = 0;
-                    int c_sum = 0;
-
-                    // Fully unrollable branchless inner loop
-                    for (int dz = 0; dz < LIMIT; ++dz) {
-                        uint8_t c = cacheRow[dz]; // 1 or 0
-                        b_sum += bWeightRow[dz] * c;
-                        c_sum += cWeightRow[dz] * c;
-                    }
-                    
-                    blockSize += b_sum;
-                    chunkSize += c_sum;
-                }
-
-                if ((blockSize >= config.minBlockSize && blockSize <= config.maxBlockSize) || 
-                        (chunkSize >= config.minChunkSize && chunkSize <= config.maxChunkSize)) {
-                        
-                        // 只在大于当前找到的最大值时才记录并写入
-                        if (blockSize > currentMaxBlockSize || chunkSize > currentMaxChunkSize) {
-                            if (blockSize > currentMaxBlockSize) currentMaxBlockSize = blockSize;
-                            if (chunkSize > currentMaxChunkSize) currentMaxChunkSize = chunkSize;
-
-                            matches++;
-                            cout << "\r                                                                                                    \r";
-                            cout << "New Max found - Pos: " << blockX << "," << blockZ 
-                                 << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
-                                 << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
-                            
-                            if (out.is_open()) {
-                                out << blockX << "," << blockZ << ";" 
-                                    << cx << "c" << inX << "," << cz << "c" << inZ << ";" 
-                                    << blockSize << ";" << chunkSize << "\n";
-                            }
-                        } // end if new max
-                    } // end if min bounds
-                } // end inZ
-            } // end inX
-        } // end totalChunks loop
+    } // end main loop
 
     auto endTime = chrono::steady_clock::now();
     auto totalElapsed = chrono::duration_cast<chrono::nanoseconds>(endTime - startTime).count();
