@@ -7,6 +7,9 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 using namespace std;
 
@@ -176,7 +179,7 @@ void runSearch(const SearchConfig& config) {
     auto cacheStartTime = chrono::steady_clock::now();
     auto lastCacheReportTime = cacheStartTime;
     cout << "Generating slime chunk cache (" << gridWidth << "x" << gridWidth << ")...\n";
-#pragma clang loop unroll_count(128)
+#pragma clang loop unroll_count(16)
     for (long long gx = 0; gx < gridWidth; ++gx) {
         auto now = chrono::steady_clock::now();
         if (chrono::duration_cast<chrono::milliseconds>(now - lastCacheReportTime).count() > 100 || gx == gridWidth - 1) {
@@ -199,11 +202,17 @@ void runSearch(const SearchConfig& config) {
 
     auto startTime = chrono::steady_clock::now();
     auto lastReportTime = startTime;
-    long long positionsChecked = 0;
+    std::atomic<long long> positionsChecked{0};
     
+    struct ChunkTarget {
+        int cx;
+        int cz;
+    };
+    std::vector<ChunkTarget> targets;
+    targets.reserve(totalComputeChunks);
+
     int x = 0, z = 0;
     int dx = 0, dz = -1;
-#pragma clang loop unroll_count(16)
     for (long long i = 0; i < spiralLimit; ++i) {
         int cx = centerChunkX + x;
         int cz = centerChunkZ + z;
@@ -225,101 +234,144 @@ void runSearch(const SearchConfig& config) {
         z += dz;
         
         if (skip) continue;
+        targets.push_back({cx, cz});
+    }
 
-        int startInX = config.fineSearch ? 0 : 8; // 挂机点在区块中心 (偏移为 8)
-        int endInX = config.fineSearch ? 15 : 8;
-        int startInZ = config.fineSearch ? 0 : 8;
-        int endInZ = config.fineSearch ? 15 : 8;
+    std::atomic<long long> atomicProcessedChunks{0};
+    std::mutex outMutex;
+    
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    
+    cout << "Using " << num_threads << " threads...\n";
 
-        for (int inX = startInX; inX <= endInX; ++inX) {
-            for (int inZ = startInZ; inZ <= endInZ; ++inZ) {
-                
-                positionsChecked++;
+    auto worker = [&](int thread_id) {
+        long long localPositionsChecked = 0;
+        for (size_t i = thread_id; i < targets.size(); i += num_threads) {
+            int cx = targets[i].cx;
+            int cz = targets[i].cz;
 
-                int blockX = cx * 16 + inX;
-                int blockZ = cz * 16 + inZ;
+            int startInX = config.fineSearch ? 0 : 8; // 挂机点在区块中心 (偏移为 8)
+            int endInX = config.fineSearch ? 15 : 8;
+            int startInZ = config.fineSearch ? 0 : 8;
+            int endInZ = config.fineSearch ? 15 : 8;
 
-                int blockSize = 0;
-                int chunkSize = 0;
-
-                long long startGx = (long long)cx - R_CHUNK - baseSearchChunkX;
-                long long startGz = (long long)cz - R_CHUNK - baseSearchChunkZ;
-                
-                const uint8_t* cacheBase = &slimeChunkCache[(size_t)(startGx * gridWidth + startGz)];
-                int weightOffset = (inX * 16 + inZ) * LIMIT * LIMIT;
-                const int* bWeightBase = &precomputedBlockWeights[weightOffset];
-                const int* cWeightBase = &precomputedChunkWeights[weightOffset];
-
-                for (int d_x = 0; d_x < LIMIT; ++d_x) {
-                    const uint8_t* cacheRow = cacheBase + d_x * gridWidth;
-                    const int* bWeightRow = bWeightBase + d_x * LIMIT;
-                    const int* cWeightRow = cWeightBase + d_x * LIMIT;
+            for (int inX = startInX; inX <= endInX; ++inX) {
+                for (int inZ = startInZ; inZ <= endInZ; ++inZ) {
                     
-                    int b_sum = 0;
-                    int c_sum = 0;
+                    localPositionsChecked++;
 
-                    // Fully unrollable branchless inner loop
-                    for (int d_z = 0; d_z < LIMIT; ++d_z) {
-                        uint8_t c = cacheRow[d_z]; // 1 or 0
-                        b_sum += bWeightRow[d_z] * c;
-                        c_sum += cWeightRow[d_z] * c;
-                    }
+                    int blockX = cx * 16 + inX;
+                    int blockZ = cz * 16 + inZ;
+
+                    int blockSize = 0;
+                    int chunkSize = 0;
+
+                    long long startGx = (long long)cx - R_CHUNK - baseSearchChunkX;
+                    long long startGz = (long long)cz - R_CHUNK - baseSearchChunkZ;
                     
-                    blockSize += b_sum;
-                    chunkSize += c_sum;
-                }
+                    const uint8_t* cacheBase = &slimeChunkCache[(size_t)(startGx * gridWidth + startGz)];
+                    int weightOffset = (inX * 16 + inZ) * LIMIT * LIMIT;
+                    const int* bWeightBase = &precomputedBlockWeights[weightOffset];
+                    const int* cWeightBase = &precomputedChunkWeights[weightOffset];
 
-                if ((blockSize >= config.minBlockSize && blockSize <= config.maxBlockSize) || 
-                    (chunkSize >= config.minChunkSize && chunkSize <= config.maxChunkSize)) {
+                    for (int d_x = 0; d_x < LIMIT; ++d_x) {
+                        const uint8_t* cacheRow = cacheBase + d_x * gridWidth;
+                        const int* bWeightRow = bWeightBase + d_x * LIMIT;
+                        const int* cWeightRow = cWeightBase + d_x * LIMIT;
                         
-                    // 只在大于当前找到的最大值时才记录并写入
-                    if (blockSize > currentMaxBlockSize || chunkSize > currentMaxChunkSize) {
-                        if (blockSize > currentMaxBlockSize) currentMaxBlockSize = blockSize;
-                        if (chunkSize > currentMaxChunkSize) currentMaxChunkSize = chunkSize;
+                        int b_sum = 0;
+                        int c_sum = 0;
 
-                        matches++;
-                        cout << "\r                                                                                                    \r";
-                        cout << "New Max found - Pos: " << blockX << "," << blockZ 
-                                << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
-                                << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
-                        
-                        lastReportTime = chrono::steady_clock::now(); 
-                        
-                        if (out.is_open()) {
-                            out << blockX << "," << blockZ << ";" 
-                                << cx << "c" << inX << "," << cz << "c" << inZ << ";" 
-                                << blockSize << ";" << chunkSize << "\n" << flush;
+                        // Fully unrollable branchless inner loop
+                        for (int d_z = 0; d_z < LIMIT; ++d_z) {
+                            uint8_t c = cacheRow[d_z]; // 1 or 0
+                            b_sum += bWeightRow[d_z] * c;
+                            c_sum += cWeightRow[d_z] * c;
                         }
+                        
+                        blockSize += b_sum;
+                        chunkSize += c_sum;
                     }
-                } 
-            } // end inZ
-        } // end inX
-        
-        processedChunks++;
 
-        // Progress bar rendering
+                    if ((blockSize >= config.minBlockSize && blockSize <= config.maxBlockSize) || 
+                        (chunkSize >= config.minChunkSize && chunkSize <= config.maxChunkSize)) {
+                            
+                        // Lock-free check first to avoid congestion
+                        if (blockSize > currentMaxBlockSize || chunkSize > currentMaxChunkSize) {
+                            std::lock_guard<std::mutex> lock(outMutex);
+                            // Double check after acquiring lock
+                            if (blockSize > currentMaxBlockSize || chunkSize > currentMaxChunkSize) {
+                                if (blockSize > currentMaxBlockSize) currentMaxBlockSize = blockSize;
+                                if (chunkSize > currentMaxChunkSize) currentMaxChunkSize = chunkSize;
+
+                                matches++;
+                                cout << "\r                                                                                                    \r";
+                                cout << "New Max found - Pos: " << blockX << "," << blockZ 
+                                        << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
+                                        << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
+                                
+                                if (out.is_open()) {
+                                    out << blockX << "," << blockZ << ";" 
+                                        << cx << "c" << inX << "," << cz << "c" << inZ << ";" 
+                                        << blockSize << ";" << chunkSize << "\n" << flush;
+                                }
+                            }
+                        }
+                    } 
+                } // end inZ
+            } // end inX
+            
+            atomicProcessedChunks++;
+        }
+        positionsChecked += localPositionsChecked;
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+
+    // Monitoring thread
+    while (true) {
+        long long currentProcessed = atomicProcessedChunks.load();
+        
         auto now = chrono::steady_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now - lastReportTime).count() > 100 || processedChunks == totalComputeChunks) {
+        if (chrono::duration_cast<chrono::milliseconds>(now - lastReportTime).count() > 100 || currentProcessed == totalComputeChunks) {
             lastReportTime = now;
             auto elapsed = chrono::duration_cast<chrono::nanoseconds>(now - startTime).count();
 
-            long long remainingChunks = totalComputeChunks - processedChunks;
-            double chunksPerSec = (double)processedChunks / (elapsed / 1e9);
+            long long remainingChunks = totalComputeChunks - currentProcessed;
+            double chunksPerSec = (double)currentProcessed / (elapsed / 1e9);
             long long etaSeconds = chunksPerSec > 0 ? (long long)(remainingChunks / chunksPerSec) : 0;
 
-            int percent = (int)((processedChunks * 100) / totalComputeChunks);
+            int percent = (int)((currentProcessed * 100) / totalComputeChunks);
+            
+            std::lock_guard<std::mutex> lock(outMutex);
             cout << "\r[";
             for (int p = 0; p < 50; ++p) {
                 if (p < percent / 2) cout << "=";
                 else if (p == percent / 2) cout << ">";
                 else cout << " ";
             }
-            cout << "] " << percent << "% (" << processedChunks << "/" << totalComputeChunks << ") "
+            cout << "] " << percent << "% (" << currentProcessed << "/" << totalComputeChunks << ") "
                     << "ETA: " << setfill('0') << setw(2) << (etaSeconds / 3600) << ":"
                     << setw(2) << ((etaSeconds % 3600) / 60) << ":"
                     << setw(2) << (etaSeconds % 60) << flush;
         }
-    } // end main loop
+
+        if (currentProcessed >= totalComputeChunks) {
+            break;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    processedChunks = atomicProcessedChunks.load();
 
     auto endTime = chrono::steady_clock::now();
     auto totalElapsed = chrono::duration_cast<chrono::nanoseconds>(endTime - startTime).count();
