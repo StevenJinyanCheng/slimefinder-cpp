@@ -1,0 +1,8 @@
+temp/
+src/
+out/
+*.exe
+results.csv
+test_*.cpp
+Test*.java
+Test*.class

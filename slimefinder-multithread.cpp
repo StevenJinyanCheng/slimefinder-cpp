@@ -87,6 +87,7 @@ struct SearchConfig {
     int minWidth = 0;
     int maxWidth = 1;
     bool fineSearch = false;
+    bool quiet = false;
     
     string outputFile = "results.csv";
 };
@@ -109,9 +110,11 @@ void runSearch(const SearchConfig& config) {
 
     int R_CHUNK = config.rChunk;
 
-    cout << "Starting search...\n";
-    cout << "Seed: " << config.seed << "\n";
-    cout << "Results will be saved to: " << config.outputFile << "\n\n";
+    if (!config.quiet) {
+        cout << "Starting search...\n";
+        cout << "Seed: " << config.seed << "\n";
+        cout << "Results will be saved to: " << config.outputFile << "\n\n";
+    }
 
     int matches = 0;
     int currentMaxBlockSize = -1;
@@ -178,11 +181,13 @@ void runSearch(const SearchConfig& config) {
 
     auto cacheStartTime = chrono::steady_clock::now();
     auto lastCacheReportTime = cacheStartTime;
-    cout << "Generating slime chunk cache (" << gridWidth << "x" << gridWidth << ")...\n";
+    if (!config.quiet) {
+        cout << "Generating slime chunk cache (" << gridWidth << "x" << gridWidth << ")...\n";
+    }
 #pragma clang loop unroll_count(16)
     for (long long gx = 0; gx < gridWidth; ++gx) {
         auto now = chrono::steady_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now - lastCacheReportTime).count() > 100 || gx == gridWidth - 1) {
+        if (!config.quiet && (chrono::duration_cast<chrono::milliseconds>(now - lastCacheReportTime).count() > 100 || gx == gridWidth - 1)) {
             lastCacheReportTime = now;
             int percent = (int)(((gx + 1) * 100) / gridWidth);
             cout << "\r[";
@@ -198,7 +203,9 @@ void runSearch(const SearchConfig& config) {
             slimeChunkCache[(size_t)(gx * gridWidth + gz)] = isSlimeChunk(config.seed, baseSearchChunkX + (int)gx, baseSearchChunkZ + (int)gz) ? 1 : 0;
         }
     }
-    cout << "\nCache generated.\n\n";
+    if (!config.quiet) {
+        cout << "\nCache generated.\n\n";
+    }
 
     auto startTime = chrono::steady_clock::now();
     auto lastReportTime = startTime;
@@ -243,7 +250,9 @@ void runSearch(const SearchConfig& config) {
     int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
     
-    cout << "Using " << num_threads << " threads...\n";
+    if (!config.quiet) {
+        cout << "Using " << num_threads << " threads...\n";
+    }
 
     auto worker = [&](int thread_id) {
         long long localPositionsChecked = 0;
@@ -306,10 +315,12 @@ void runSearch(const SearchConfig& config) {
                                 if (chunkSize > currentMaxChunkSize) currentMaxChunkSize = chunkSize;
 
                                 matches++;
-                                cout << "\r                                                                                                    \r";
-                                cout << "New Max found - Pos: " << blockX << "," << blockZ 
-                                        << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
-                                        << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
+                                if (!config.quiet) {
+                                    cout << "\r                                                                                                    \r";
+                                    cout << "New Max found - Pos: " << blockX << "," << blockZ 
+                                            << " Chunk: " << cx << "c" << inX << "," << cz << "c" << inZ
+                                            << " Blocks: " << blockSize << " Chunks: " << chunkSize << "\n";
+                                }
                                 
                                 if (out.is_open()) {
                                     out << blockX << "," << blockZ << ";" 
@@ -337,7 +348,7 @@ void runSearch(const SearchConfig& config) {
         long long currentProcessed = atomicProcessedChunks.load();
         
         auto now = chrono::steady_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now - lastReportTime).count() > 100 || currentProcessed == totalComputeChunks) {
+        if (!config.quiet && (chrono::duration_cast<chrono::milliseconds>(now - lastReportTime).count() > 100 || currentProcessed == totalComputeChunks)) {
             lastReportTime = now;
             auto elapsed = chrono::duration_cast<chrono::nanoseconds>(now - startTime).count();
 
@@ -377,10 +388,11 @@ void runSearch(const SearchConfig& config) {
     auto totalElapsed = chrono::duration_cast<chrono::nanoseconds>(endTime - startTime).count();
     double nsPerCheck = positionsChecked > 0 ? (double)totalElapsed / positionsChecked : 0.0;
     
-    // NOTE: This finishes the outer function
-    cout << "\nSearch complete. Found " << matches << " matches.\n";
-    cout << fixed << setprecision(0) << positionsChecked << " of " << positionsChecked << " positions checked.\n";
-    cout << fixed << setprecision(0) << nsPerCheck << " nanoseconds per position\n";
+    if (!config.quiet) {
+        cout << "\nSearch complete. Found " << matches << " matches.\n";
+        cout << fixed << setprecision(0) << positionsChecked << " of " << positionsChecked << " positions checked.\n";
+        cout << fixed << setprecision(0) << nsPerCheck << " nanoseconds per position\n";
+    }
 } // END runSearch
 
 int main(int argc, char* argv[]) {
@@ -391,6 +403,7 @@ int main(int argc, char* argv[]) {
         string arg = argv[i];
         if (arg == "--seed" && i + 1 < argc) config.seed = stoll(argv[++i]);
         else if (arg == "--fine") config.fineSearch = true;
+        else if (arg == "--quiet" || arg == "--silent") config.quiet = true;
         else if (arg == "--out" && i + 1 < argc) config.outputFile = argv[++i];
         else if (arg == "--maxWidth" && i + 1 < argc) config.maxWidth = stoi(argv[++i]);
         else if (arg == "--minWidth" && i + 1 < argc) config.minWidth = stoi(argv[++i]);
@@ -408,6 +421,7 @@ int main(int argc, char* argv[]) {
                  << "  --startZ <int>\n"
                  << "  --maxWidth <int>\n"
                  << "  --fine\n"
+                 << "  --quiet\n"
                  << "  --out <filename>\n"
                  << "  --minChunkSize <int> / --maxChunkSize <int>\n"
                  << "  --minBlockSize <int> / --maxBlockSize <int>\n";
